@@ -1,34 +1,34 @@
 import os
 import shutil
+import argparse
+import json
 from datetime import datetime
 
-# File categories
-FILE_TYPES = {
-    "Images": [".jpg", ".jpeg", ".png", ".gif"],
-    "Documents": [".pdf", ".docx", ".txt", ".pptx"],
-    "Videos": [".mp4", ".mkv", ".avi"],
-    "Music": [".mp3", ".wav"]
-}
-
-LOG_FILE = "organizer_log.txt"
+LOG_FILE = "organizer_log.json"
 
 
-def log_action(message):
-    with open(LOG_FILE, "a") as log:
-        log.write(f"{datetime.now()} - {message}\n")
+def load_config():
+    with open("config.json", "r") as f:
+        return json.load(f)
 
 
-def create_folder(path):
-    if not os.path.exists(path):
-        os.makedirs(path)
-        log_action(f"Created folder: {path}")
+def save_log(data):
+    with open(LOG_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+
+def load_log():
+    if not os.path.exists(LOG_FILE):
+        return []
+    with open(LOG_FILE, "r") as f:
+        return json.load(f)
 
 
 def get_unique_filename(folder, filename):
     base, ext = os.path.splitext(filename)
     counter = 1
-
     new_name = filename
+
     while os.path.exists(os.path.join(folder, new_name)):
         new_name = f"{base}_{counter}{ext}"
         counter += 1
@@ -36,52 +36,92 @@ def get_unique_filename(folder, filename):
     return new_name
 
 
-def move_file(file_path, dest_folder):
-    filename = os.path.basename(file_path)
-    unique_name = get_unique_filename(dest_folder, filename)
+def move_file(src, dest, dry_run, log_data):
+    filename = os.path.basename(src)
+    unique_name = get_unique_filename(dest, filename)
+    dest_path = os.path.join(dest, unique_name)
 
-    dest_path = os.path.join(dest_folder, unique_name)
-    shutil.move(file_path, dest_path)
+    if dry_run:
+        print(f"[DRY RUN] {filename} → {dest}")
+    else:
+        shutil.move(src, dest_path)
+        print(f"Moved: {filename} → {dest}")
 
-    print(f"Moved: {filename} → {dest_folder}")
-    log_action(f"Moved {filename} to {dest_folder}")
+    log_data.append({
+        "source": src,
+        "destination": dest_path
+    })
 
 
-def organize_files(source_folder):
-    if not os.path.exists(source_folder):
-        print("❌ Folder does not exist!")
-        return
+def organize(path, config, dry_run):
+    log_data = []
 
-    print(f"\n📂 Organizing files in: {source_folder}\n")
-
-    for file in os.listdir(source_folder):
-        file_path = os.path.join(source_folder, file)
+    for file in os.listdir(path):
+        file_path = os.path.join(path, file)
 
         if os.path.isfile(file_path):
             moved = False
 
-            for folder, extensions in FILE_TYPES.items():
+            for category, extensions in config.items():
                 if any(file.lower().endswith(ext) for ext in extensions):
-                    dest_folder = os.path.join(source_folder, folder)
-                    create_folder(dest_folder)
-                    move_file(file_path, dest_folder)
+                    year = datetime.fromtimestamp(
+                        os.path.getmtime(file_path)
+                    ).strftime("%Y")
+
+                    dest_folder = os.path.join(path, category, year)
+                    os.makedirs(dest_folder, exist_ok=True)
+
+                    move_file(file_path, dest_folder, dry_run, log_data)
                     moved = True
                     break
 
             if not moved:
-                other_folder = os.path.join(source_folder, "Others")
-                create_folder(other_folder)
-                move_file(file_path, other_folder)
+                other = os.path.join(path, "Others")
+                os.makedirs(other, exist_ok=True)
+                move_file(file_path, other, dry_run, log_data)
 
-    print("\n✅ Organization Complete!")
-    log_action("Completed organization process")
+    if not dry_run:
+        save_log(log_data)
+
+    print("\n✅ Done!")
+
+
+def undo():
+    log_data = load_log()
+
+    if not log_data:
+        print("Nothing to undo!")
+        return
+
+    for entry in reversed(log_data):
+        src = entry["destination"]
+        dest = os.path.dirname(entry["source"])
+
+        if os.path.exists(src):
+            shutil.move(src, dest)
+            print(f"Restored: {os.path.basename(src)}")
+
+    print("\n↩ Undo completed!")
 
 
 def main():
-    print("===== Smart File Organizer =====")
-    path = input("Enter folder path to organize: ").strip()
+    parser = argparse.ArgumentParser(description="Smart File Organizer")
+    parser.add_argument("--path", help="Folder path to organize")
+    parser.add_argument("--dry-run", action="store_true", help="Preview only")
+    parser.add_argument("--undo", action="store_true", help="Undo last operation")
 
-    organize_files(path)
+    args = parser.parse_args()
+
+    if args.undo:
+        undo()
+        return
+
+    if not args.path:
+        print("Please provide --path")
+        return
+
+    config = load_config()
+    organize(args.path, config, args.dry_run)
 
 
 if __name__ == "__main__":
