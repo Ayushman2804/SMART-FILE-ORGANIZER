@@ -28,3 +28,11 @@ Output: Files sorted into categorized folders
 - GUI interface
 - Drag & drop support
 - Scheduled automation
+
+ ## Advanced Features
+- CLI-based usage with argparse
+- Configurable file categories (JSON-based)
+- Dry-run preview mode
+- Undo last operation
+- Organizes files by year
+- Intelligent duplicate handling
