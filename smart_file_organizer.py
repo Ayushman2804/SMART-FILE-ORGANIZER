@@ -2,11 +2,13 @@
 
 A robust CLI automation tool that systematically categorizes and declutters
 directories by file type and modification year, featuring collision safety,
-dry-run preview, operation rollback (undo), and self-protection filters.
+SHA-256 byte-level deduplication, dry-run preview, operation rollback (undo),
+and self-protection filters.
 """
 
 import argparse
 from datetime import datetime
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -27,10 +29,14 @@ DEFAULT_LOG_PATH = BASE_DIR / "organizer_log.json"
 
 # Default fallback categories if config.json is missing or corrupted
 FALLBACK_CONFIG: Dict[str, List[str]] = {
-    "Images": [".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"],
-    "Documents": [".pdf", ".docx", ".doc", ".txt", ".pptx", ".xlsx", ".csv"],
-    "Videos": [".mp4", ".mkv", ".avi", ".mov", ".wmv"],
-    "Music": [".mp3", ".wav", ".flac", ".aac"],
+    "Images": [".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".bmp", ".tiff", ".ico"],
+    "Documents": [".pdf", ".docx", ".doc", ".txt", ".pptx", ".ppt", ".odt", ".rtf", ".md"],
+    "Music": [".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a"],
+    "Videos": [".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm"],
+    "Archives": [".zip", ".tar", ".gz", ".rar", ".7z", ".bz2", ".xz", ".iso"],
+    "Data": [".csv", ".xlsx", ".xls", ".json", ".parquet", ".sql", ".tsv", ".xml"],
+    "Code": [".py", ".js", ".ts", ".html", ".css", ".cpp", ".c", ".java", ".sh", ".bat", ".ipynb", ".rs", ".go"],
+    "Executables": [".exe", ".msi", ".dmg", ".pkg", ".deb", ".rpm", ".apk"],
 }
 
 # System files, temp files, and extensions to always ignore
@@ -99,6 +105,20 @@ def save_log(log_data: List[Dict[str, Any]], log_path: Path = DEFAULT_LOG_PATH) 
             json.dump(log_data, f, indent=4)
     except OSError as e:
         print(f"[!] Error saving log to '{log_path}': {e}")
+
+
+def compute_file_hash(file_path: Path, chunk_size: int = 65536) -> Optional[str]:
+    """Calculate the SHA-256 checksum of a file efficiently using streamed byte chunks."""
+    if not file_path.is_file():
+        return None
+    hasher = hashlib.sha256()
+    try:
+        with open(file_path, "rb") as f:
+            while chunk := f.read(chunk_size):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    except (PermissionError, OSError):
+        return None
 
 
 def get_unique_path(dest_folder: Path, filename: str) -> Path:
@@ -188,10 +208,12 @@ def organize(
     target_dir: Path,
     config: Dict[str, List[str]],
     dry_run: bool = False,
+    dedup: bool = False,
+    dedup_action: str = "move",
     log_path: Path = DEFAULT_LOG_PATH,
     verbose: bool = False,
 ) -> None:
-    """Scan and organize loose files in target_dir according to category and year."""
+    """Scan and organize loose files in target_dir according to category, year, and duplicates."""
     if not target_dir.exists():
         print(f"[x] Error: Target directory '{target_dir}' does not exist.")
         return
@@ -207,6 +229,9 @@ def organize(
     else:
         print("[MODE]   LIVE EXECUTION")
 
+    if dedup:
+        print(f"[DEDUP]  SHA-256 byte deduplication active (Action: {dedup_action.upper()})")
+
     # Identify protected paths that must never be moved
     protected_paths: Set[Path] = {
         Path(__file__).resolve(),
@@ -215,12 +240,21 @@ def organize(
         (BASE_DIR / "README.md").resolve(),
     }
 
-    # All recognized categories + 'Others'
-    category_names: Set[str] = set(config.keys()) | {"Others"}
+    # All recognized categories + 'Others' and 'Duplicates'
+    category_names: Set[str] = set(config.keys()) | {"Others", "Duplicates"}
 
     log_data: List[Dict[str, Any]] = []
-    stats: Dict[str, int] = {"moved": 0, "skipped": 0, "errors": 0}
+    stats: Dict[str, int] = {
+        "moved": 0,
+        "duplicates_moved": 0,
+        "duplicates_deleted": 0,
+        "skipped": 0,
+        "errors": 0,
+    }
     category_counts: Dict[str, int] = {cat: 0 for cat in category_names}
+
+    # Hash cache for duplicate detection: hash -> original_path
+    seen_hashes: Dict[str, Path] = {}
 
     try:
         items = list(target_root.iterdir())
@@ -237,7 +271,90 @@ def organize(
                 print(f"  [SKIP] {item.name} ({reason})")
             continue
 
-        # Determine Category
+        # Extract modification year
+        try:
+            mtime = item.stat().st_mtime
+            year = datetime.fromtimestamp(mtime).strftime("%Y")
+        except OSError:
+            year = "Unknown"
+
+        # Check for true byte duplicate if deduplication is enabled
+        duplicate_ref: Optional[Path] = None
+        item_hash: Optional[str] = None
+
+        if dedup:
+            item_hash = compute_file_hash(item)
+            if item_hash:
+                # 1. Check if identical file was encountered in this batch
+                if item_hash in seen_hashes:
+                    duplicate_ref = seen_hashes[item_hash]
+                else:
+                    # 2. Check if identical file already exists in expected destination
+                    item_ext = item.suffix.lower()
+                    target_category = "Others"
+                    for cat, extensions in config.items():
+                        if item_ext in extensions:
+                            target_category = cat
+                            break
+                    potential_dest = target_root / target_category / year / item.name
+                    if potential_dest.exists() and compute_file_hash(potential_dest) == item_hash:
+                        duplicate_ref = potential_dest
+
+        # Handle Duplicate
+        if duplicate_ref is not None:
+            if dedup_action == "delete":
+                if dry_run:
+                    print(f"  [DUP-DEL]  {item.name} (identical to {duplicate_ref.name})")
+                    stats["duplicates_deleted"] += 1
+                else:
+                    try:
+                        item.unlink()
+                        print(f"  [DUP-DEL]  {item.name} (deleted - identical to {duplicate_ref.name})")
+                        stats["duplicates_deleted"] += 1
+                        log_data.append({
+                            "action": "delete",
+                            "timestamp": datetime.now().isoformat(),
+                            "source": str(item.resolve()),
+                            "destination": None,
+                            "original_parent": str(target_root),
+                            "is_duplicate": True,
+                            "duplicate_of": str(duplicate_ref.resolve()),
+                        })
+                    except (PermissionError, OSError) as e:
+                        print(f"  [ERROR]   Could not delete {item.name}: {e}")
+                        stats["errors"] += 1
+                continue
+            else:
+                # Default dedup action: move to Duplicates/<Year>/
+                dup_folder = target_root / "Duplicates" / year
+                unique_dest_path = get_unique_path(dup_folder, item.name)
+
+                if dry_run:
+                    print(f"  [DUP-MOVE] {item.name} -> Duplicates/{year}/{unique_dest_path.name} (identical to {duplicate_ref.name})")
+                    stats["duplicates_moved"] += 1
+                    category_counts["Duplicates"] += 1
+                else:
+                    try:
+                        dup_folder.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(item), str(unique_dest_path))
+                        print(f"  [DUP-MOVE] {item.name} -> Duplicates/{year}/{unique_dest_path.name}")
+                        stats["duplicates_moved"] += 1
+                        category_counts["Duplicates"] += 1
+                        log_data.append({
+                            "action": "move",
+                            "timestamp": datetime.now().isoformat(),
+                            "source": str(item.resolve()),
+                            "destination": str(unique_dest_path.resolve()),
+                            "original_parent": str(target_root),
+                            "is_duplicate": True,
+                            "duplicate_of": str(duplicate_ref.resolve()),
+                        })
+                    except (PermissionError, OSError) as e:
+                        print(f"  [ERROR]   Could not move duplicate {item.name}: {e}")
+                        stats["errors"] += 1
+                continue
+
+        # Standard Category Resolution
         item_ext = item.suffix.lower()
         matched_category = "Others"
 
@@ -245,13 +362,6 @@ def organize(
             if item_ext in extensions:
                 matched_category = category
                 break
-
-        # Extract modification year
-        try:
-            mtime = item.stat().st_mtime
-            year = datetime.fromtimestamp(mtime).strftime("%Y")
-        except OSError:
-            year = "Unknown"
 
         # Construct destination directory: <target>/<Category>/<Year>
         dest_folder = target_root / matched_category / year
@@ -261,6 +371,8 @@ def organize(
             print(f"  [DRY RUN] {item.name} -> {matched_category}/{year}/{unique_dest_path.name}")
             stats["moved"] += 1
             category_counts[matched_category] += 1
+            if dedup and item_hash:
+                seen_hashes[item_hash] = unique_dest_path
         else:
             try:
                 dest_folder.mkdir(parents=True, exist_ok=True)
@@ -268,11 +380,15 @@ def organize(
                 print(f"  [MOVED]   {item.name} -> {matched_category}/{year}/{unique_dest_path.name}")
                 stats["moved"] += 1
                 category_counts[matched_category] += 1
+                if dedup and item_hash:
+                    seen_hashes[item_hash] = unique_dest_path
                 log_data.append({
+                    "action": "move",
                     "timestamp": datetime.now().isoformat(),
                     "source": str(item.resolve()),
                     "destination": str(unique_dest_path.resolve()),
                     "original_parent": str(target_root),
+                    "is_duplicate": False,
                 })
             except (PermissionError, OSError) as e:
                 print(f"  [ERROR]   Could not move {item.name}: {e}")
@@ -290,6 +406,10 @@ def organize(
     for cat, count in category_counts.items():
         if count > 0:
             print(f"  - {cat:12}: {count}")
+    if dedup:
+        total_dups = stats["duplicates_moved"] + stats["duplicates_deleted"]
+        action_note = "deleted" if dedup_action == "delete" else "moved to Duplicates/"
+        print(f"Duplicates Detected:   {total_dups} ({action_note})")
     print(f"Items Skipped/Ignored: {stats['skipped']}")
     if stats["errors"] > 0:
         print(f"Failed Transfers:      {stats['errors']}")
@@ -315,8 +435,13 @@ def undo(log_path: Path = DEFAULT_LOG_PATH) -> None:
     affected_dirs: Set[Path] = set()
 
     for entry in reversed(log_data):
+        action = entry.get("action", "move")
         src_str = entry.get("destination")
         dest_str = entry.get("source")
+
+        if action == "delete":
+            print(f"  [NOTICE]   Permanently deleted duplicate cannot be restored: {dest_str}")
+            continue
 
         if not src_str or not dest_str:
             continue
@@ -342,7 +467,6 @@ def undo(log_path: Path = DEFAULT_LOG_PATH) -> None:
     # Prune now-empty category and year folders
     pruned_count = 0
     for folder in affected_dirs:
-        # Stop at root directory
         stop_boundary = folder.parent.parent if folder.parent and folder.parent.parent else folder.parent
         pruned_count += prune_empty_dir_chain(folder, stop_boundary)
 
@@ -364,7 +488,7 @@ def undo(log_path: Path = DEFAULT_LOG_PATH) -> None:
 def main() -> None:
     """CLI entry point for Smart File Organizer."""
     parser = argparse.ArgumentParser(
-        description="Smart File Organizer: Categorize & sort files safely by type and year."
+        description="Smart File Organizer: Categorize & sort files safely by type, year, and duplicate status."
     )
     parser.add_argument(
         "--path",
@@ -382,6 +506,17 @@ def main() -> None:
         "-u",
         action="store_true",
         help="Revert the last organization operation",
+    )
+    parser.add_argument(
+        "--dedup",
+        action="store_true",
+        help="Enable SHA-256 byte-level duplicate detection",
+    )
+    parser.add_argument(
+        "--dedup-action",
+        choices=["move", "delete"],
+        default="move",
+        help="Action for detected duplicates: 'move' (default, moves to Duplicates/ folder) or 'delete'",
     )
     parser.add_argument(
         "--config",
@@ -416,6 +551,8 @@ def main() -> None:
         target_dir=target_path,
         config=config,
         dry_run=args.dry_run,
+        dedup=args.dedup,
+        dedup_action=args.dedup_action,
         log_path=log_file,
         verbose=args.verbose,
     )

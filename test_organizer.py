@@ -18,6 +18,10 @@ class TestSmartFileOrganizer(unittest.TestCase):
             "Documents": [".pdf", ".txt"],
             "Videos": [".mp4"],
             "Music": [".mp3"],
+            "Code": [".py", ".ts"],
+            "Archives": [".zip", ".tar"],
+            "Data": [".csv", ".json"],
+            "Executables": [".exe"],
         }
 
     def tearDown(self):
@@ -65,6 +69,31 @@ class TestSmartFileOrganizer(unittest.TestCase):
         self.assertTrue(expected_other.exists())
         self.assertTrue(self.log_file.exists())
 
+    def test_expanded_categories(self):
+        code_file = self.test_dir / "script.py"
+        zip_file = self.test_dir / "backup.zip"
+        csv_file = self.test_dir / "data.csv"
+        exe_file = self.test_dir / "setup.exe"
+
+        code_file.write_text("print('hello')")
+        zip_file.write_text("fake zip")
+        csv_file.write_text("id,name")
+        exe_file.write_text("fake exe")
+
+        current_year = datetime.now().strftime("%Y")
+
+        sfo.organize(
+            target_dir=self.test_dir,
+            config=self.config,
+            dry_run=False,
+            log_path=self.log_file,
+        )
+
+        self.assertTrue((self.test_dir / "Code" / current_year / "script.py").exists())
+        self.assertTrue((self.test_dir / "Archives" / current_year / "backup.zip").exists())
+        self.assertTrue((self.test_dir / "Data" / current_year / "data.csv").exists())
+        self.assertTrue((self.test_dir / "Executables" / current_year / "setup.exe").exists())
+
     def test_collision_handling(self):
         dest_folder = self.test_dir / "Images" / "2024"
         dest_folder.mkdir(parents=True)
@@ -77,8 +106,76 @@ class TestSmartFileOrganizer(unittest.TestCase):
         unique_path_2 = sfo.get_unique_path(dest_folder, "pic.png")
         self.assertEqual(unique_path_2.name, "pic_2.png")
 
+    def test_file_hashing_sha256(self):
+        f1 = self.test_dir / "file1.txt"
+        f2 = self.test_dir / "file2.txt"
+        f3 = self.test_dir / "file3.txt"
+
+        f1.write_text("identical bytes")
+        f2.write_text("identical bytes")
+        f3.write_text("different bytes")
+
+        h1 = sfo.compute_file_hash(f1)
+        h2 = sfo.compute_file_hash(f2)
+        h3 = sfo.compute_file_hash(f3)
+
+        self.assertIsNotNone(h1)
+        self.assertEqual(h1, h2)
+        self.assertNotEqual(h1, h3)
+
+    def test_deduplication_move_action(self):
+        f_orig = self.test_dir / "contract.pdf"
+        f_dup = self.test_dir / "contract_copy.pdf"
+        f_orig.write_text("exact contract agreement")
+        f_dup.write_text("exact contract agreement")
+
+        current_year = datetime.now().strftime("%Y")
+
+        sfo.organize(
+            target_dir=self.test_dir,
+            config=self.config,
+            dry_run=False,
+            dedup=True,
+            dedup_action="move",
+            log_path=self.log_file,
+        )
+
+        orig_dest = self.test_dir / "Documents" / current_year / "contract.pdf"
+        dup_dest = self.test_dir / "Duplicates" / current_year / "contract_copy.pdf"
+
+        self.assertTrue(orig_dest.exists())
+        self.assertTrue(dup_dest.exists())
+
+        # Test Undo restores both
+        sfo.undo(log_path=self.log_file)
+        self.assertTrue((self.test_dir / "contract.pdf").exists())
+        self.assertTrue((self.test_dir / "contract_copy.pdf").exists())
+        self.assertFalse((self.test_dir / "Duplicates").exists())
+
+    def test_deduplication_delete_action(self):
+        f_orig = self.test_dir / "notes.txt"
+        f_dup = self.test_dir / "notes_backup.txt"
+        f_orig.write_text("my notes")
+        f_dup.write_text("my notes")
+
+        current_year = datetime.now().strftime("%Y")
+
+        sfo.organize(
+            target_dir=self.test_dir,
+            config=self.config,
+            dry_run=False,
+            dedup=True,
+            dedup_action="delete",
+            log_path=self.log_file,
+        )
+
+        orig_dest = self.test_dir / "Documents" / current_year / "notes.txt"
+        self.assertTrue(orig_dest.exists())
+        # Duplicate should have been deleted
+        self.assertFalse((self.test_dir / "notes_backup.txt").exists())
+        self.assertFalse((self.test_dir / "Duplicates").exists())
+
     def test_protected_and_ignored_files(self):
-        # Create ignored items
         hidden = self.test_dir / ".hidden_file.txt"
         hidden.write_text("hidden")
         sys_file = self.test_dir / "desktop.ini"
@@ -93,7 +190,6 @@ class TestSmartFileOrganizer(unittest.TestCase):
             log_path=self.log_file,
         )
 
-        # None of the protected/ignored files should have moved
         self.assertTrue(hidden.exists())
         self.assertTrue(sys_file.exists())
         self.assertTrue(crdownload.exists())
@@ -103,7 +199,6 @@ class TestSmartFileOrganizer(unittest.TestCase):
         doc.write_text("contract text")
         current_year = datetime.now().strftime("%Y")
 
-        # Organize
         sfo.organize(
             target_dir=self.test_dir,
             config=self.config,
@@ -114,21 +209,15 @@ class TestSmartFileOrganizer(unittest.TestCase):
         organized_path = self.test_dir / "Documents" / current_year / "contract.txt"
         self.assertTrue(organized_path.exists())
 
-        # Undo
         sfo.undo(log_path=self.log_file)
-
-        # File should be restored to test_dir
         self.assertTrue(doc.exists())
-        # Organized folder should be pruned
         self.assertFalse((self.test_dir / "Documents").exists())
 
     def test_re_nesting_prevention(self):
-        # Test that running twice does not re-nest already organized subfolders
         pic = self.test_dir / "vacation.jpg"
         pic.write_text("photo")
         current_year = datetime.now().strftime("%Y")
 
-        # 1st run
         sfo.organize(
             target_dir=self.test_dir,
             config=self.config,
@@ -139,7 +228,6 @@ class TestSmartFileOrganizer(unittest.TestCase):
         organized_path = self.test_dir / "Images" / current_year / "vacation.jpg"
         self.assertTrue(organized_path.exists())
 
-        # 2nd run on same directory
         sfo.organize(
             target_dir=self.test_dir,
             config=self.config,
@@ -147,16 +235,13 @@ class TestSmartFileOrganizer(unittest.TestCase):
             log_path=self.log_file,
         )
 
-        # File should remain at Images/2026/vacation.jpg and NOT Images/2026/Images/2026/vacation.jpg
         self.assertTrue(organized_path.exists())
         self.assertFalse((self.test_dir / "Images" / current_year / "Images").exists())
 
     def test_corrupted_log_graceful_handling(self):
-        # Write corrupted non-json string to log
         bad_log = self.test_dir / "bad_log.json"
         bad_log.write_text("2026-03-21 11:04:00 - Not valid JSON!")
 
-        # Should return empty list and not crash
         logs = sfo.load_log(bad_log)
         self.assertEqual(logs, [])
 
@@ -164,7 +249,6 @@ class TestSmartFileOrganizer(unittest.TestCase):
         bad_config = self.test_dir / "bad_config.json"
         bad_config.write_text("{broken json")
 
-        # Should fallback to default config and not crash
         cfg = sfo.load_config(bad_config)
         self.assertIn("Images", cfg)
         self.assertIn(".jpg", cfg["Images"])
