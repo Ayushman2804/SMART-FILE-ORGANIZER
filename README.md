@@ -1,8 +1,9 @@
 # Smart File Organizer (Python)
 
+[![CI](https://github.com/Ayushman2804/SMART-FILE-ORGANIZER/actions/workflows/ci.yml/badge.svg)](https://github.com/Ayushman2804/SMART-FILE-ORGANIZER/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Ayushman2804/SMART-FILE-ORGANIZER)](https://github.com/Ayushman2804/SMART-FILE-ORGANIZER/releases)
 [![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Code Style](https://img.shields.io/badge/Code%20Style-Black-black.svg)](https://github.com/psf/black)
 
 A reliable, cross-platform Python CLI automation utility that systematically categorizes and declutters messy directories (such as `Downloads` or `Desktop`) into organized folders based on file category, year of last modification, SHA-256 duplicate detection, content-aware AI/NLP document classification, and real-time background folder monitoring.
 
