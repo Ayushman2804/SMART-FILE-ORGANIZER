@@ -15,7 +15,7 @@ class TestSmartFileOrganizer(unittest.TestCase):
         self.log_file = self.test_dir / "test_log.json"
         self.config = {
             "Images": [".jpg", ".png"],
-            "Documents": [".pdf", ".txt"],
+            "Documents": [".pdf", ".txt", ".docx", ".md"],
             "Videos": [".mp4"],
             "Music": [".mp3"],
             "Code": [".py", ".ts"],
@@ -171,9 +171,66 @@ class TestSmartFileOrganizer(unittest.TestCase):
 
         orig_dest = self.test_dir / "Documents" / current_year / "notes.txt"
         self.assertTrue(orig_dest.exists())
-        # Duplicate should have been deleted
         self.assertFalse((self.test_dir / "notes_backup.txt").exists())
         self.assertFalse((self.test_dir / "Duplicates").exists())
+
+    def test_smart_document_classification_logic(self):
+        inv_file = self.test_dir / "bill.txt"
+        inv_file.write_text("Tax Invoice #8234 Billed To Acme Corp Total Amount Due: $1500 GSTIN: 29A")
+
+        res_file = self.test_dir / "profile.txt"
+        res_file.write_text("Curriculum Vitae Education B.Tech Work Experience Technical Skills Projects")
+
+        paper_file = self.test_dir / "deep_learning.txt"
+        paper_file.write_text("Abstract: We propose a new transformer model. Introduction Methodology Literature Review References")
+
+        legal_file = self.test_dir / "nda.txt"
+        legal_file.write_text("Non-Disclosure Agreement Confidentiality Terms of Service Governing Law Indemnification")
+
+        general_file = self.test_dir / "grocery_list.txt"
+        general_file.write_text("Milk, eggs, apples, bread")
+
+        cat_inv, conf_inv = sfo.classify_document(inv_file)
+        cat_res, conf_res = sfo.classify_document(res_file)
+        cat_paper, conf_paper = sfo.classify_document(paper_file)
+        cat_legal, conf_legal = sfo.classify_document(legal_file)
+        cat_gen, conf_gen = sfo.classify_document(general_file)
+
+        self.assertEqual(cat_inv, "Invoices_Receipts")
+        self.assertEqual(cat_res, "Resumes_Career")
+        self.assertEqual(cat_paper, "Research_Academic")
+        self.assertEqual(cat_legal, "Legal_Contracts")
+        self.assertEqual(cat_gen, "General")
+
+    def test_smart_docs_organization_and_undo(self):
+        inv = self.test_dir / "aws_invoice.pdf"
+        inv.write_text("Tax Invoice Receipt Total Amount Due $50")
+
+        resume = self.test_dir / "ayushman_resume.pdf"
+        resume.write_text("Curriculum Vitae Work Experience Technical Skills")
+
+        current_year = datetime.now().strftime("%Y")
+
+        sfo.organize(
+            target_dir=self.test_dir,
+            config=self.config,
+            dry_run=False,
+            smart_docs=True,
+            log_path=self.log_file,
+        )
+
+        expected_inv = self.test_dir / "Documents" / "Invoices_Receipts" / current_year / "aws_invoice.pdf"
+        expected_res = self.test_dir / "Documents" / "Resumes_Career" / current_year / "ayushman_resume.pdf"
+
+        self.assertTrue(expected_inv.exists())
+        self.assertTrue(expected_res.exists())
+
+        # Test Undo restores files and prunes all nested subdirectories
+        sfo.undo(log_path=self.log_file)
+
+        self.assertTrue(inv.exists())
+        self.assertTrue(resume.exists())
+        self.assertFalse((self.test_dir / "Documents").exists())
 
     def test_protected_and_ignored_files(self):
         hidden = self.test_dir / ".hidden_file.txt"

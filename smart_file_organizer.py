@@ -2,8 +2,8 @@
 
 A robust CLI automation tool that systematically categorizes and declutters
 directories by file type and modification year, featuring collision safety,
-SHA-256 byte-level deduplication, dry-run preview, operation rollback (undo),
-and self-protection filters.
+SHA-256 byte-level deduplication, content-aware NLP/AI document categorization,
+dry-run preview, operation rollback (undo), and self-protection filters.
 """
 
 import argparse
@@ -39,6 +39,49 @@ FALLBACK_CONFIG: Dict[str, List[str]] = {
     "Executables": [".exe", ".msi", ".dmg", ".pkg", ".deb", ".rpm", ".apk"],
 }
 
+# Semantic document classification taxonomy
+DOC_TAXONOMY: Dict[str, Dict[str, Any]] = {
+    "Invoices_Receipts": {
+        "keywords": [
+            "invoice", "receipt", "bill to", "billed to", "tax invoice", "subtotal",
+            "total amount", "amount due", "payment receipt", "gstin", "order id",
+            "payment due", "remit to", "vat", "purchase order", "transaction id",
+            "balance due", "unit price"
+        ],
+    },
+    "Resumes_Career": {
+        "keywords": [
+            "curriculum vitae", "resume", "work experience", "education", "technical skills",
+            "projects", "certifications", "job description", "responsibilities", "employment history",
+            "qualifications", "internship", "hiring", "applicant", "contact information",
+            "b.tech", "bachelor of", "master of"
+        ],
+    },
+    "Research_Academic": {
+        "keywords": [
+            "abstract", "introduction", "methodology", "literature review", "references",
+            "conclusion", "proceedings of", "arxiv", "ieee", "springer", "acm",
+            "university", "syllabus", "thesis", "dissertation", "lecture notes",
+            "doi:", "experiment", "citation", "conference"
+        ],
+    },
+    "Legal_Contracts": {
+        "keywords": [
+            "agreement", "contract", "terms and conditions", "terms of service", "privacy policy",
+            "non-disclosure", "nda", "confidentiality", "governing law", "jurisdiction",
+            "indemnification", "arbitration", "hereby agrees", "parties hereto",
+            "intellectual property", "in witness whereof"
+        ],
+    },
+    "Technical_Guides": {
+        "keywords": [
+            "api documentation", "user manual", "getting started", "installation guide",
+            "architecture", "cheatsheet", "release notes", "troubleshooting", "sdk",
+            "endpoint", "configuration guide", "developer guide"
+        ],
+    },
+}
+
 # System files, temp files, and extensions to always ignore
 IGNORED_FILENAMES: Set[str] = {
     "desktop.ini",
@@ -66,7 +109,6 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> Dict[str, List[str]]
         with open(config_path, "r", encoding="utf-8") as f:
             data = json.load(f)
             if isinstance(data, dict):
-                # Ensure all extensions are lowercased and prefixed with '.'
                 normalized: Dict[str, List[str]] = {}
                 for category, exts in data.items():
                     if isinstance(exts, list):
@@ -121,13 +163,100 @@ def compute_file_hash(file_path: Path, chunk_size: int = 65536) -> Optional[str]
         return None
 
 
+def extract_document_text(file_path: Path, max_chars: int = 4000) -> str:
+    """Extract readable text from PDF, DOCX, TXT, or markdown documents."""
+    ext = file_path.suffix.lower()
+
+    # Plain text formats
+    if ext in {".txt", ".md", ".rtf", ".csv", ".json", ".xml", ".html", ".py"}:
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read(max_chars)
+        except OSError:
+            return ""
+
+    # PDF format (uses pypdf if available)
+    if ext == ".pdf":
+        try:
+            import logging
+            logging.getLogger("pypdf").setLevel(logging.ERROR)
+            import pypdf
+            reader = pypdf.PdfReader(str(file_path))
+            extracted: List[str] = []
+            for page in reader.pages[:3]:  # Check first 3 pages
+                text = page.extract_text()
+                if text:
+                    extracted.append(text)
+                if sum(len(t) for t in extracted) >= max_chars:
+                    break
+            if extracted:
+                return "\n".join(extracted)[:max_chars]
+        except Exception:
+            pass
+
+        # Fallback in case of mock or non-standard text streams
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read(max_chars)
+        except OSError:
+            return ""
+
+    # DOCX format (pure stdlib zipfile/xml parser)
+    if ext == ".docx":
+        try:
+            import zipfile
+            import xml.etree.ElementTree as ET
+            with zipfile.ZipFile(file_path) as z:
+                if "word/document.xml" in z.namelist():
+                    xml_content = z.read("word/document.xml")
+                    tree = ET.fromstring(xml_content)
+                    return "".join(node.text for node in tree.iter() if node.text)[:max_chars]
+        except Exception:
+            return ""
+
+    return ""
+
+
+def classify_document(file_path: Path) -> Tuple[str, float]:
+    """Analyze document filename and text content to predict its semantic subcategory.
+
+    Returns:
+        (subcategory_name, confidence_percent)
+    """
+    text_content = extract_document_text(file_path).lower()
+    name_clean = file_path.stem.lower().replace("_", " ").replace("-", " ")
+
+    scores: Dict[str, float] = {cat: 0.0 for cat in DOC_TAXONOMY}
+
+    for cat, data in DOC_TAXONOMY.items():
+        keywords = data["keywords"]
+        for kw in keywords:
+            # Filename matches provide high confidence
+            if kw in name_clean:
+                scores[cat] += 3.5
+
+            # Content matches
+            if text_content:
+                count = text_content.count(kw)
+                if count > 0:
+                    scores[cat] += min(count, 4) * 1.0
+
+    best_cat, best_score = max(scores.items(), key=lambda x: x[1])
+
+    # Minimum threshold to avoid misclassification
+    if best_score >= 2.0:
+        confidence = min(round((best_score / (best_score + 3.0)) * 100, 1), 99.0)
+        return best_cat, confidence
+
+    return "General", 0.0
+
+
 def get_unique_path(dest_folder: Path, filename: str) -> Path:
     """Generate a collision-safe destination path by appending an incremental counter."""
     target_path = dest_folder / filename
     if not target_path.exists():
         return target_path
 
-    # Extract stem and suffix carefully
     stem = target_path.stem
     suffix = target_path.suffix
 
@@ -210,10 +339,11 @@ def organize(
     dry_run: bool = False,
     dedup: bool = False,
     dedup_action: str = "move",
+    smart_docs: bool = False,
     log_path: Path = DEFAULT_LOG_PATH,
     verbose: bool = False,
 ) -> None:
-    """Scan and organize loose files in target_dir according to category, year, and duplicates."""
+    """Scan and organize loose files in target_dir according to category, year, and content."""
     if not target_dir.exists():
         print(f"[x] Error: Target directory '{target_dir}' does not exist.")
         return
@@ -231,6 +361,8 @@ def organize(
 
     if dedup:
         print(f"[DEDUP]  SHA-256 byte deduplication active (Action: {dedup_action.upper()})")
+    if smart_docs:
+        print("[SMART]  Content-aware document classification enabled")
 
     # Identify protected paths that must never be moved
     protected_paths: Set[Path] = {
@@ -252,6 +384,7 @@ def organize(
         "errors": 0,
     }
     category_counts: Dict[str, int] = {cat: 0 for cat in category_names}
+    doc_subcounts: Dict[str, int] = {subcat: 0 for subcat in list(DOC_TAXONOMY.keys()) + ["General"]}
 
     # Hash cache for duplicate detection: hash -> original_path
     seen_hashes: Dict[str, Path] = {}
@@ -363,12 +496,25 @@ def organize(
                 matched_category = category
                 break
 
-        # Construct destination directory: <target>/<Category>/<Year>
-        dest_folder = target_root / matched_category / year
+        # Check for smart document classification
+        subcat: Optional[str] = None
+        conf: float = 0.0
+
+        if matched_category == "Documents" and smart_docs:
+            subcat, conf = classify_document(item)
+            doc_subcounts[subcat] += 1
+            dest_folder = target_root / "Documents" / subcat / year
+        else:
+            dest_folder = target_root / matched_category / year
+
         unique_dest_path = get_unique_path(dest_folder, item.name)
+        display_rel = dest_folder.relative_to(target_root) / unique_dest_path.name
 
         if dry_run:
-            print(f"  [DRY RUN] {item.name} -> {matched_category}/{year}/{unique_dest_path.name}")
+            if subcat:
+                print(f"  [SMART-DOC] {item.name} -> {display_rel} ({conf}% conf)")
+            else:
+                print(f"  [DRY RUN]   {item.name} -> {display_rel}")
             stats["moved"] += 1
             category_counts[matched_category] += 1
             if dedup and item_hash:
@@ -377,7 +523,11 @@ def organize(
             try:
                 dest_folder.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(item), str(unique_dest_path))
-                print(f"  [MOVED]   {item.name} -> {matched_category}/{year}/{unique_dest_path.name}")
+                if subcat:
+                    print(f"  [SMART-DOC] {item.name} -> {display_rel} ({conf}% conf)")
+                else:
+                    print(f"  [MOVED]     {item.name} -> {display_rel}")
+
                 stats["moved"] += 1
                 category_counts[matched_category] += 1
                 if dedup and item_hash:
@@ -389,9 +539,10 @@ def organize(
                     "destination": str(unique_dest_path.resolve()),
                     "original_parent": str(target_root),
                     "is_duplicate": False,
+                    "doc_subcategory": subcat,
                 })
             except (PermissionError, OSError) as e:
-                print(f"  [ERROR]   Could not move {item.name}: {e}")
+                print(f"  [ERROR]     Could not move {item.name}: {e}")
                 stats["errors"] += 1
 
     # Save transaction log on successful non-dry runs
@@ -406,10 +557,18 @@ def organize(
     for cat, count in category_counts.items():
         if count > 0:
             print(f"  - {cat:12}: {count}")
+
+    if smart_docs and any(cnt > 0 for cnt in doc_subcounts.values()):
+        print("\nDocument Subcategories:")
+        for sc, cnt in doc_subcounts.items():
+            if cnt > 0:
+                print(f"    * {sc:18}: {cnt}")
+
     if dedup:
         total_dups = stats["duplicates_moved"] + stats["duplicates_deleted"]
         action_note = "deleted" if dedup_action == "delete" else "moved to Duplicates/"
-        print(f"Duplicates Detected:   {total_dups} ({action_note})")
+        print(f"\nDuplicates Detected:   {total_dups} ({action_note})")
+
     print(f"Items Skipped/Ignored: {stats['skipped']}")
     if stats["errors"] > 0:
         print(f"Failed Transfers:      {stats['errors']}")
@@ -433,11 +592,16 @@ def undo(log_path: Path = DEFAULT_LOG_PATH) -> None:
     restored = 0
     errors = 0
     affected_dirs: Set[Path] = set()
+    roots: Set[Path] = set()
 
     for entry in reversed(log_data):
         action = entry.get("action", "move")
         src_str = entry.get("destination")
         dest_str = entry.get("source")
+        parent_root_str = entry.get("original_parent")
+
+        if parent_root_str:
+            roots.add(Path(parent_root_str))
 
         if action == "delete":
             print(f"  [NOTICE]   Permanently deleted duplicate cannot be restored: {dest_str}")
@@ -452,7 +616,6 @@ def undo(log_path: Path = DEFAULT_LOG_PATH) -> None:
         if src_path.exists():
             try:
                 dest_path.parent.mkdir(parents=True, exist_ok=True)
-                # If original filename was renamed on conflict, restore safely
                 safe_dest = get_unique_path(dest_path.parent, dest_path.name)
                 shutil.move(str(src_path), str(safe_dest))
                 print(f"  [RESTORED] {src_path.name} -> {safe_dest.parent}")
@@ -464,11 +627,12 @@ def undo(log_path: Path = DEFAULT_LOG_PATH) -> None:
         else:
             print(f"  [SKIP] File not found (moved or deleted): {src_path.name}")
 
-    # Prune now-empty category and year folders
+    # Prune now-empty category, subcategory, and year folders all the way up to target root
     pruned_count = 0
     for folder in affected_dirs:
-        stop_boundary = folder.parent.parent if folder.parent and folder.parent.parent else folder.parent
-        pruned_count += prune_empty_dir_chain(folder, stop_boundary)
+        # Match target root if recorded
+        matching_root = next((r for r in roots if folder.is_relative_to(r)), folder.parent.parent)
+        pruned_count += prune_empty_dir_chain(folder, matching_root)
 
     # Clear log after undo completes
     save_log([], log_path)
@@ -488,7 +652,7 @@ def undo(log_path: Path = DEFAULT_LOG_PATH) -> None:
 def main() -> None:
     """CLI entry point for Smart File Organizer."""
     parser = argparse.ArgumentParser(
-        description="Smart File Organizer: Categorize & sort files safely by type, year, and duplicate status."
+        description="Smart File Organizer: Categorize & sort files safely by type, year, and content."
     )
     parser.add_argument(
         "--path",
@@ -516,7 +680,13 @@ def main() -> None:
         "--dedup-action",
         choices=["move", "delete"],
         default="move",
-        help="Action for detected duplicates: 'move' (default, moves to Duplicates/ folder) or 'delete'",
+        help="Action for detected duplicates: 'move' (default, moves to Duplicates/) or 'delete'",
+    )
+    parser.add_argument(
+        "--smart-docs",
+        "-s",
+        action="store_true",
+        help="Enable AI/NLP semantic document classification (Invoices, Resumes, Academic, Legal, Technical, General)",
     )
     parser.add_argument(
         "--config",
@@ -553,6 +723,7 @@ def main() -> None:
         dry_run=args.dry_run,
         dedup=args.dedup,
         dedup_action=args.dedup_action,
+        smart_docs=args.smart_docs,
         log_path=log_file,
         verbose=args.verbose,
     )
