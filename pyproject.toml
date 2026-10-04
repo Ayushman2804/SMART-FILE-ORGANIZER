@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smart-file-organizer"
+version = "1.0.0"
+description = "Intelligent cross-platform CLI tool to categorize, deduplicate, and semantically organize files."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+    { name = "Ayushman Banerjee", email = "banerjeeayushman280405@gmail.com" }
+]
+keywords = [
+    "file-organizer",
+    "automation",
+    "cli",
+    "productivity",
+    "deduplication",
+    "nlp",
+    "python"
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Utilities",
+]
+
+dependencies = []
+
+[project.optional-dependencies]
+all = [
+    "watchdog>=3.0.0",
+    "pypdf>=3.0.0",
+    "rich>=13.0.0",
+]
+watcher = ["watchdog>=3.0.0"]
+pdf = ["pypdf>=3.0.0"]
+ui = ["rich>=13.0.0"]
+
+[project.scripts]
+smart-organizer = "smart_file_organizer:main"
+
+[tool.setuptools]
+py-modules = ["smart_file_organizer"]

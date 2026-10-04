@@ -550,6 +550,67 @@ def organize(
         save_log(log_data, log_path)
 
     # Output Summary Report
+    print_summary(
+        stats=stats,
+        category_counts=category_counts,
+        doc_subcounts=doc_subcounts,
+        smart_docs=smart_docs,
+        dedup=dedup,
+        dedup_action=dedup_action,
+        dry_run=dry_run,
+    )
+
+
+def print_summary(
+    stats: Dict[str, int],
+    category_counts: Dict[str, int],
+    doc_subcounts: Dict[str, int],
+    smart_docs: bool = False,
+    dedup: bool = False,
+    dedup_action: str = "move",
+    dry_run: bool = False,
+) -> None:
+    """Print organization results using Rich tables if available, or clean ASCII fallback."""
+    try:
+        from rich.console import Console
+        from rich.table import Table
+
+        console = Console()
+        table = Table(title="Organization Summary", border_style="cyan")
+        table.add_column("Category / Metric", style="bold white")
+        table.add_column("Count", justify="right", style="green")
+
+        for cat, count in category_counts.items():
+            if count > 0:
+                table.add_row(f"{cat}", str(count))
+
+        if smart_docs and any(cnt > 0 for cnt in doc_subcounts.values()):
+            table.add_section()
+            for sc, cnt in doc_subcounts.items():
+                if cnt > 0:
+                    table.add_row(f"  └─ {sc}", str(cnt))
+
+        table.add_section()
+        table.add_row("Total Files Organized", str(stats["moved"]))
+        if dedup:
+            total_dups = stats["duplicates_moved"] + stats["duplicates_deleted"]
+            action_label = "deleted" if dedup_action == "delete" else "isolated in Duplicates/"
+            table.add_row(f"Duplicates Handled ({action_label})", str(total_dups))
+        table.add_row("Items Skipped / Ignored", str(stats["skipped"]))
+        if stats["errors"] > 0:
+            table.add_row("Failed Transfers", f"[red]{stats['errors']}[/red]")
+
+        console.print()
+        console.print(table)
+        if dry_run:
+            console.print("[yellow]Tip: Run without --dry-run to apply changes.[/yellow]\n")
+        else:
+            console.print("[green][SUCCESS] Finished successfully! (Use --undo to revert)[/green]\n")
+        return
+    except ImportError:
+        pass
+
+    # Standard ASCII fallback
     print("\n" + "=" * 45)
     print("ORGANIZATION SUMMARY")
     print("=" * 45)
@@ -578,6 +639,70 @@ def organize(
         print("Tip: Run without --dry-run to apply changes.\n")
     else:
         print("[SUCCESS] Finished successfully! (Use --undo to revert)\n")
+
+
+def start_watcher(
+    target_dir: Path,
+    config: Dict[str, List[str]],
+    dedup: bool = False,
+    dedup_action: str = "move",
+    smart_docs: bool = False,
+    log_path: Path = DEFAULT_LOG_PATH,
+    verbose: bool = False,
+) -> None:
+    """Monitor target_dir in real-time and auto-organize newly added files."""
+    try:
+        from watchdog.observers import Observer
+        from watchdog.events import FileSystemEventHandler
+    except ImportError:
+        print("[x] Error: The 'watchdog' package is required for real-time monitoring.")
+        print("    Install it using: pip install watchdog (or pip install -e .[all])")
+        return
+
+    import time
+
+    class LiveFileHandler(FileSystemEventHandler):
+        def __init__(self) -> None:
+            super().__init__()
+            self._processing: Set[str] = set()
+
+        def on_created(self, event: Any) -> None:
+            if event.is_directory:
+                return
+            src = Path(event.src_path)
+            # Brief delay to allow large downloads or file copy writes to stabilize
+            time.sleep(1.0)
+            if src.exists() and src.name not in self._processing:
+                self._processing.add(src.name)
+                print(f"\n[WATCH] New file detected: {src.name}")
+                organize(
+                    target_dir=target_dir,
+                    config=config,
+                    dry_run=False,
+                    dedup=dedup,
+                    dedup_action=dedup_action,
+                    smart_docs=smart_docs,
+                    log_path=log_path,
+                    verbose=verbose,
+                )
+                self._processing.discard(src.name)
+
+    handler = LiveFileHandler()
+    observer = Observer()
+    observer.schedule(handler, path=str(target_dir), recursive=False)
+    observer.start()
+
+    print(f"\n[WATCHING] Live monitoring active on: {target_dir}")
+    print("           New files will be organized automatically. Press Ctrl+C to stop.\n")
+
+    try:
+        while True:
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("\n[STOPPING] Shutting down file watcher...")
+        observer.stop()
+    observer.join()
+    print("[STOPPED] File watcher terminated cleanly.\n")
 
 
 def undo(log_path: Path = DEFAULT_LOG_PATH) -> None:
@@ -689,6 +814,12 @@ def main() -> None:
         help="Enable AI/NLP semantic document classification (Invoices, Resumes, Academic, Legal, Technical, General)",
     )
     parser.add_argument(
+        "--watch",
+        "-w",
+        action="store_true",
+        help="Run as a real-time background watcher to auto-organize new files instantly",
+    )
+    parser.add_argument(
         "--config",
         "-c",
         help="Path to custom config.json file",
@@ -717,6 +848,31 @@ def main() -> None:
 
     target_path = Path(args.path).expanduser().resolve()
     config = load_config(config_file)
+
+    if args.watch:
+        # Run an initial organization pass before entering watch mode
+        print("\n[INIT] Performing initial organization sweep...")
+        organize(
+            target_dir=target_path,
+            config=config,
+            dry_run=args.dry_run,
+            dedup=args.dedup,
+            dedup_action=args.dedup_action,
+            smart_docs=args.smart_docs,
+            log_path=log_file,
+            verbose=args.verbose,
+        )
+        start_watcher(
+            target_dir=target_path,
+            config=config,
+            dedup=args.dedup,
+            dedup_action=args.dedup_action,
+            smart_docs=args.smart_docs,
+            log_path=log_file,
+            verbose=args.verbose,
+        )
+        return
+
     organize(
         target_dir=target_path,
         config=config,
@@ -731,3 +887,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
